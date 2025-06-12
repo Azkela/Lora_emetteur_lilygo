@@ -1,0 +1,219 @@
+name: Auto Tag & Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.set_version.outputs.NEW_VERSION }}
+      last_tag: ${{ steps.get_latest_tag.outputs.TAG }}
+    steps:
+      - name: Checkout repository (with tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Get latest tag
+        id: get_latest_tag
+        run: |
+          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            LAST_TAG=$(git describe --tags --abbrev=0)
+          else
+            LAST_TAG=""
+          fi
+          echo "TAG=$LAST_TAG" >> $GITHUB_OUTPUT
+
+      - name: Determine next version
+        id: set_version
+        run: |
+          latest_tag="${{ steps.get_latest_tag.outputs.TAG }}"
+          if [ -z "$latest_tag" ]; then
+            version="0.0.0"
+          else
+            version=$(echo $latest_tag | sed 's/v//')
+          fi
+
+          major=$(echo $version | cut -d. -f1)
+          minor=$(echo $version | cut -d. -f2)
+          patch=$(echo $version | cut -d. -f3)
+
+          if git log -1 --pretty=%B | grep -q "#major"; then
+            major=$((major + 1))
+            minor=0
+            patch=0
+          elif git log -1 --pretty=%B | grep -q "#minor"; then
+            minor=$((minor + 1))
+            patch=0
+          else
+            patch=$((patch + 1))
+          fi
+
+          new_version="v$major.$minor.$patch"
+          echo "NEW_VERSION=$new_version" >> $GITHUB_OUTPUT
+
+  changelog:
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      changelog_path: release_notes.md
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Generate Changelog
+        run: |
+          echo "## 📝 Changelog" > release_notes.md
+          echo "" >> release_notes.md
+          echo "### 🚀 Changes in this release (${{ needs.prepare.outputs.new_version }})" >> release_notes.md
+          echo "" >> release_notes.md
+
+          if [ -z "${{ needs.prepare.outputs.last_tag }}" ]; then
+            git log --pretty=format:"- [%h](https://github.com/${{ github.repository }}/commit/%h) %s" >> release_notes.md
+          else
+            git log ${{ needs.prepare.outputs.last_tag }}..HEAD --pretty=format:"- [%h](https://github.com/${{ github.repository }}/commit/%h) %s" >> release_notes.md
+          fi
+
+          echo "" >> release_notes.md
+          echo "### 📂 Modified Files" >> release_notes.md
+          echo "" >> release_notes.md
+
+          if [ -z "${{ needs.prepare.outputs.last_tag }}" ]; then
+            commits=$(git log --pretty=format:"%h")
+          else
+            commits=$(git log ${{ needs.prepare.outputs.last_tag }}..HEAD --pretty=format:"%h")
+          fi
+
+          for commit in $commits; do
+            echo "#### Commit: $commit" >> release_notes.md
+            git show --name-only --pretty=format:"" $commit | sed 's/^/- /' >> release_notes.md
+            echo "" >> release_notes.md
+          done
+
+      - name: Upload changelog artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release_notes
+          path: release_notes.md
+
+  build:
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install PlatformIO
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Build with PlatformIO
+        run: |
+          platformio run
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: .pio/build/
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [prepare, changelog, build]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: release_notes
+
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: firmware
+
+      - name: Create Tag (safe idempotent)
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          if git rev-parse ${{ needs.prepare.outputs.new_version }} >/dev/null 2>&1; then
+            echo "Tag already exists"
+          else
+            git tag ${{ needs.prepare.outputs.new_version }}
+            git push origin ${{ needs.prepare.outputs.new_version }}
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate manifest, package & flash command
+        run: |
+          mkdir dist
+          # Recherche récursive des binaires (peu importe le sous-répertoire)
+          find firmware -name "*.bin" -exec cp {} dist/ \;
+
+          cd dist
+
+          # SHA256 sums
+          for file in *.bin; do
+            sha256sum "$file" >> sha256sums.txt
+          done
+
+          # Manifest.json
+          echo "{" > manifest.json
+          echo "  \"version\": \"${{ needs.prepare.outputs.new_version }}\"," >> manifest.json
+          echo "  \"files\": [" >> manifest.json
+          for file in *.bin; do
+            sha=$(sha256sum "$file" | awk '{print $1}')
+            size=$(stat --format="%s" "$file")
+            echo "    {" >> manifest.json
+            echo "      \"name\": \"$file\"," >> manifest.json
+            echo "      \"size\": $size," >> manifest.json
+            echo "      \"sha256\": \"$sha\"" >> manifest.json
+            echo "    }," >> manifest.json
+          done | sed '$ s/},/}/' >> manifest.json
+          echo "  ]" >> manifest.json
+          echo "}" >> manifest.json
+
+          # ZIP package
+          zip firmware_package.zip *.bin manifest.json sha256sums.txt
+
+          # Génération de la commande esptool
+          FLASH_CMD="esptool.py --chip esp32 --baud 460800 --before default_reset --after hard_reset write_flash"
+          FLASH_CMD="$FLASH_CMD 0x1000 bootloader.bin 0x8000 partitions.bin 0x10000 firmware.bin"
+
+          echo "" >> ../release_notes.md
+          echo "### 🛠 Flash command" >> ../release_notes.md
+          echo "" >> ../release_notes.md
+          echo '```bash' >> ../release_notes.md
+          echo "$FLASH_CMD" >> ../release_notes.md
+          echo '```' >> ../release_notes.md
+
+      - name: Upload release with full package
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.new_version }}
+          name: "Release ${{ needs.prepare.outputs.new_version }}"
+          body_path: release_notes.md
+          files: dist/firmware_package.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
