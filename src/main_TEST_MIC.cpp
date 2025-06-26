@@ -6,7 +6,7 @@
 // Pins pour le micro I2S INMP441
 #define I2S_WS 15 
 #define I2S_SD 35 
-#define I2S_SCK 14 
+#define I2S_SCK 25
 
 #define I2S_PORT I2S_NUM_0
 

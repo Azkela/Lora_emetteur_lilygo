@@ -13,10 +13,10 @@
 // INMP441
 #define I2S_WS     15
 #define I2S_SD     35
-#define I2S_SCK    33
+#define I2S_SCK    25
 // UART Mega
-#define MEGA_RX_PIN 13
-#define MEGA_TX_PIN 12
+#define MEGA_RX_PIN 14
+#define MEGA_TX_PIN 13
 // LoRa
 #define LORA_SS    18
 #define LORA_RST   23
@@ -71,17 +71,15 @@ void loop() {
   //}
   sensorDust.checkForData();
 
-  // Toutes les 10 secondes, on lit les capteurs locaux et on envoie tout
+  // Toutes les 1 secondes, on lit les capteurs locaux et on envoie tout
   if (millis() - previousMillis >= LORA_INTERVAL) {
     previousMillis = millis();
 
     Serial.println("\n--- Cycle de lecture et d'envoi ---");
     
-    // Donner l'ordre de lecture aux capteurs
     sensorBME.read();
     sensorMic.read();
 
-    // Envoyer toutes les données récupérées via LoRa
     transmitterLoRa.sendData(
       GROUP_ID,
       sensorBME.getTemperature(),
